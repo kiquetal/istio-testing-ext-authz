@@ -72,6 +72,34 @@ When a client requests `http://dummy-svc-app:8080/v1/customer/{msisdn}` (e.g. `/
 5.  If they match: returns `200 OK`, injects user headers, and Envoy allows the request to pass.
 6.  If they mismatch (e.g., trying to access `/v1/customer/3434234234`): returns `403 Forbidden` with a custom `x-auth-reason: path-msisdn-mismatch` header.
 
+#### Architecture Sequence Flow (Mermaid)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Envoy as Envoy Sidecar (Target Pod)
+    participant Auth as Go External Authorizer (dummy-ext-auth-server)
+    participant App as Target Application (dummy-svc-app)
+
+    Client->>Envoy: GET /v1/customer/123456789<br/>Authorization: Bearer <JWT: msisdn=123456789>
+    Note over Envoy: Envoy intercepts request
+    Envoy->>Auth: HTTP POST /check<br/>Path: /v1/customer/123456789<br/>Headers: Authorization, Host
+    Note over Auth: 1. Extract path MSISDN (123456789)<br/>2. Base64-decode JWT payload<br/>3. Match Token MSISDN with Path MSISDN
+    
+    alt Match Successful (200 OK)
+        Auth-->>Envoy: 200 OK<br/>X-Auth-User: Alice<br/>X-Auth-Email: alice@example.com
+        Note over Envoy: Inject custom identity headers
+        Envoy->>App: GET /v1/customer/123456789<br/>X-Auth-User: Alice<br/>X-Auth-Email: alice@example.com
+        App-->>Envoy: 200 OK (JSON Data)
+        Envoy-->>Client: 200 OK (JSON Data)
+    else Mismatch Detected (403 Forbidden)
+        Auth-->>Envoy: 403 Forbidden<br/>Content-Type: application/json<br/>x-auth-reason: path-msisdn-mismatch
+        Note over Envoy: Short-circuit request
+        Envoy-->>Client: 403 Forbidden (Error JSON)
+    end
+```
+
 
 ---
 
