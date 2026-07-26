@@ -155,6 +155,56 @@ When the external authorizer blocks a request, it returns a structured JSON payl
 
 ---
 
+## Security Auditing: Tracking Cross-Tenant Access Violations
+
+To detect malicious scans, credential stuffing, or tenant isolation breaches, the external authorizer must log all path/JWT mismatches as high-severity security events.
+
+### 1. Structured Logging Specification
+When a `path-msisdn-mismatch` is triggered, the authorizer should output a structured JSON log to `stdout` for ingestion by SIEM/aggregators (e.g., Elasticsearch, Splunk, Datadog):
+
+```json
+{
+  "timestamp": "2026-07-26T03:38:13Z",
+  "level": "WARN",
+  "event": "tenant-access-violation",
+  "target_service": "dummy-svc-app:8080",
+  "request_id": "b8eea1b2-2900-4347-9653-ccd9f6572f8b",
+  "client_identity": "spiffe://cluster.local/ns/foo/sa/default",
+  "token_claims": {
+    "user_name": "Alice",
+    "token_msisdn": "123456789"
+  },
+  "requested_resource": {
+    "path": "/v1/customer/3434234234",
+    "extracted_msisdn": "3434234234"
+  },
+  "action": "DENY"
+}
+```
+
+### 2. Audit Fields Matrix
+
+| Log Field | Description | Purpose in Forensics |
+| :--- | :--- | :--- |
+| `event` | Hardcoded classification: `tenant-access-violation` | Allows security filters to easily aggregate all cross-tenant violations. |
+| `client_identity` | Parsed from `X-Forwarded-Client-Cert` (SPIFFE ID) | Identifies exactly *which* service inside the mesh initiated the call. |
+| `token_claims.user_name` | Parsed from the token payload | Identifies the authenticated human caller name. |
+| `token_claims.token_msisdn` | Parsed from the token payload | Identifies the MSISDN ownership claims tied to the token. |
+| `requested_resource.extracted_msisdn` | Parsed from URL path parameter | Identifies the target MSISDN they attempted to read/modify. |
+| `request_id` | Original Envoy trace header | Allows correlating the denial with distributed APM traces (Jaeger/Zipkin). |
+
+### 3. Alarm and Telemetry Guidelines
+*   **Prometheus Metric**: Expose an incremental counter:
+    ```prometheus
+    nomos_auth_violations_total{service="dummy-svc-app", reason="path-msisdn-mismatch"}
+    ```
+*   **SIEM Alarm**: Configure an alarm in your log aggregator to trigger whenever:
+    *   An individual token triggers $> 5$ violations in under 5 minutes.
+    *   A single IP or SPIFFE client identity triggers $> 10$ violations on any service (indicates automated API scraping/brute force).
+
+---
+
 ## Run Validation Tests
 Check **[test-curl.md](file:///mydata/codes/2026/istio-testing-ext-authz/test-curl.md)** for full testing details and copy-pasteable curls to test mismatched and matching MSISDN validation!
+
 
