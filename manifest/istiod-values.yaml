@@ -5,7 +5,7 @@ meshConfig:
     envoyExtAuthzHttp:
       service: "ext-authz.foo.svc.cluster.local"
       port: 8000
-      includeRequestHeadersInCheck: ["authorization", "cookie", "x-ext-authz", "x-msisdn"]
+      includeRequestHeadersInCheck: ["authorization", "cookie", "x-ext-authz", "host", "x-forwarded-host", ":authority"]
       headersToUpstreamOnAllow: ["x-auth-user", "x-auth-email"]
       headersToDownstreamOnDeny: ["content-type", "x-auth-reason"]
   - name: "ext-authz-grpc"
