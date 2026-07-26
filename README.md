@@ -100,6 +100,8 @@ sequenceDiagram
     end
 ```
 
+#### Visual Diagram (PNG)
+![Nomos Architecture Diagram](architecture.png)
 
 ---
 
