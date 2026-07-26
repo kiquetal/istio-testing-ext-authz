@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dummy-ext-auth-server
+  namespace: foo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ext-authz
+  template:
+    metadata:
+      labels:
+        app: ext-authz
+    spec:
+      containers:
+      - name: ext-auth-server
+        image: dummy-ext-auth-server:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8000
