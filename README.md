@@ -19,59 +19,142 @@ kubectl config current-context
 
 ---
 
-## Istio Installation & Configuration
+## Architecture & Codebase
 
-Istio is installed using the `istio-operator` manifest which registers external authorization providers in `MeshConfig`.
+This setup consists of four primary components:
+1.  **Istio Helm Values**: Configures Istio control plane to register external authorizers.
+2.  **Go External Authorizer (`dummy-ext-auth-server`)**: A custom Go service that intercepts requests, decodes a fake JWT token payload, and matches the parsed MSISDN field against the incoming HTTP header to make authorization decisions.
+3.  **Go Protected Application (`dummy-svc-app`)**: A custom Go service that handles deep paths (such as `/v1/customer/*`) and prints received headers and details.
+4.  **Testing Environment (`curl-test-pod`)**: A persistent in-mesh pod to run interactively with `curlimages/curl`.
+
+### Codebase Paths
+*   **[dummy-ext-auth-server/](file:///mydata/codes/2026/istio-testing-ext-authz/dummy-ext-auth-server)**: Custom Go external authorizer codebase.
+*   **[dummy-svc-app/](file:///mydata/codes/2026/istio-testing-ext-authz/dummy-svc-app)**: Custom Go target application codebase.
 
 ### Manifest Directory
-The installation manifest is located in:
-*   [manifest/istio-operator.yaml](file:///mydata/codes/2026/istio-testing-ext-authz/manifest/istio-operator.yaml)
+All deployment and configuration manifests are located in:
+*   [manifest/istiod-values.yaml](file:///mydata/codes/2026/istio-testing-ext-authz/manifest/istiod-values.yaml): Custom values for `istio/istiod` registering the authorizer.
+*   [manifest/dummy-ext-auth-server.yaml](file:///mydata/codes/2026/istio-testing-ext-authz/manifest/dummy-ext-auth-server.yaml): Deploying the Go authorizer.
+*   [manifest/dummy-svc-app.yaml](file:///mydata/codes/2026/istio-testing-ext-authz/manifest/dummy-svc-app.yaml): Deploying the target application and `AuthorizationPolicy` protecting `/v1/customer/*`.
+*   [manifest/curl-test-pod.yaml](file:///mydata/codes/2026/istio-testing-ext-authz/manifest/curl-test-pod.yaml): Deploying the in-mesh persistent testing pod.
 
-### Manifest Structure & Details
-The `istio-operator.yaml` manifest defines an `IstioOperator` configuration. The key component is the `meshConfig.extensionProviders` section, which registers external services that Istio can call to make authorization decisions:
+For interactive curl testing steps, see **[test-curl.md](file:///mydata/codes/2026/istio-testing-ext-authz/test-curl.md)**.
+
+---
+
+## Detailed Configuration & Flow
+
+### 1. Registering the Provider (`istiod-values.yaml`)
+Registered as an HTTP extension provider under `meshConfig.extensionProviders`:
 
 ```yaml
-apiVersion: install.istio.io/v1alpha1
-kind: IstioOperator
-spec:
-  profile: demo
-  meshConfig:
-    accessLogFile: /dev/stdout
-    extensionProviders:
-    - name: "ext-authz-http"
-      envoyExtAuthzHttp:
-        service: "ext-authz.foo.svc.cluster.local"
-        port: "8000"
-        includeRequestHeadersInCheck: ["authorization", "cookie"]
-        headersToUpstreamOnAllow: ["x-auth-user", "x-auth-email"]
-        headersToDownstreamOnDeny: ["content-type", "x-auth-reason"]
-    - name: "ext-authz-grpc"
-      envoyExtAuthzGrpc:
-        service: "ext-authz.foo.svc.cluster.local"
-        port: "9000"
+meshConfig:
+  extensionProviders:
+  - name: "ext-authz-http"
+    envoyExtAuthzHttp:
+      service: "ext-authz.foo.svc.cluster.local"
+      port: 8000
+      includeRequestHeadersInCheck: ["authorization", "cookie", "x-ext-authz"]
+      headersToUpstreamOnAllow: ["x-auth-user", "x-auth-email"]
+      headersToDownstreamOnDeny: ["content-type", "x-auth-reason"]
 ```
 
-#### Detailed Explanation of Key Parameters:
-- **`profile: demo`**: Uses the Istio `demo` profile, which is pre-configured with egress and ingress gateways, suitable for testing and development.
-- **`meshConfig.accessLogFile: /dev/stdout`**: Configures Envoy proxies to print access logs to standard output, making troubleshooting easier.
-- **`extensionProviders`**:
-  - **`ext-authz-http`**:
-    - **`envoyExtAuthzHttp`**: Specifies an HTTP-based external authorization service.
-    - **`service`**: Points to the FQDN of the external authorizer service (`ext-authz.foo.svc.cluster.local`).
-    - **`port`**: The service port (`8000`).
-    - **`includeRequestHeadersInCheck`**: Specifies headers (e.g., `authorization`, `cookie`) that should be forwarded from the client request to the authorization service.
-    - **`headersToUpstreamOnAllow`**: Extra headers (like `x-auth-user`, `x-auth-email`) returned by the authorizer on success that will be forwarded to the backend service.
-    - **`headersToDownstreamOnDeny`**: Headers returned by the authorizer on denial that will be returned back to the client.
-  - **`ext-authz-grpc`**:
-    - **`envoyExtAuthzGrpc`**: Specifies a high-performance gRPC-based external authorization service at port `9000`.
+*   **`includeRequestHeadersInCheck`**: Forwards `authorization` (the JWT) from the incoming request to the authorizer.
+*   **`headersToUpstreamOnAllow`**: Injects authorization metadata (`X-Auth-User`, `X-Auth-Email`) on success to the backend.
 
-### Applying the Installation
-To apply this configuration, run:
-```bash
-istioctl install -f manifest/istio-operator.yaml -y
+### 2. Path-Based JWT Verification Logic
+When a client requests `http://dummy-svc-app:8080/v1/customer/{msisdn}` (e.g. `/v1/customer/123456789`):
+1.  **Envoy** intercepts the request and forwards the request path and the `Authorization` header to **`dummy-ext-auth-server`**.
+2.  **`dummy-ext-auth-server`** parses the `msisdn` directly from the URL path segment (extracting the last segment).
+3.  It base64-decodes the Bearer JWT token payload:
+    `{"name":"Alice","msisdn":"123456789"}`
+4.  It compares the **`msisdn` value from the decoded token** with the **MSISDN parsed from the URL path**.
+5.  If they match: returns `200 OK`, injects user headers, and Envoy allows the request to pass.
+6.  If they mismatch (e.g., trying to access `/v1/customer/3434234234`): returns `403 Forbidden` with a custom `x-auth-reason: path-msisdn-mismatch` header.
+
+
+---
+
+## Installation & Deployment Steps
+
+1.  **Add and update the Istio Helm repository**:
+    ```bash
+    helm repo add istio https://istio-release.storage.googleapis.com/charts
+    helm repo update
+    ```
+
+2.  **Install Istio Base (containing CRDs)**:
+    ```bash
+    helm install istio-base istio/base -n istio-system --create-namespace
+    ```
+
+3.  **Install Istiod**:
+    ```bash
+    helm install istiod istio/istiod -n istio-system --values manifest/istiod-values.yaml
+    ```
+
+4.  **Build images inside Minikube's Local Docker Registry**:
+    ```bash
+    minikube -p auth-ext image build -t dummy-ext-auth-server:latest dummy-ext-auth-server/
+    minikube -p auth-ext image build -t dummy-svc-app:latest dummy-svc-app/
+    ```
+
+5.  **Apply manifests**:
+    ```bash
+    kubectl apply -f manifest/dummy-ext-auth-server.yaml
+    # Deploy an active ext-authz service selector pointing to the deployment
+    kubectl apply -f manifest/ext-authz.yaml 
+    kubectl apply -f manifest/dummy-svc-app.yaml
+    kubectl apply -f manifest/curl-test-pod.yaml
+    ```
+
+6.  **Verify Pod Readiness**:
+    ```bash
+    kubectl get pods -n foo
+    # Output should show dummy-ext-auth-server, dummy-svc-app, and curl-test-pod fully Running (2/2 ready)
+    ```
+
+---
+
+## Generating Fake Authorization Tokens
+
+To simulate a JWT token with a custom `name` and `msisdn`, follow these steps:
+
+1.  **Draft your JSON Payload**:
+    ```json
+    {"name":"Alice","msisdn":"123456789"}
+    ```
+
+2.  **Base64 encode the Payload segment**:
+    In your terminal, run:
+    ```bash
+    echo -n '{"name":"Alice","msisdn":"123456789"}' | base64
+    # Outputs: eyJuYW1lIjoiQWxpY2UiLCJtc2lzZG4iOiIxMjM0NTY3ODkifQ==
+    ```
+
+3.  **Construct the Bearer Token**:
+    JWTs consist of three parts (`Header.Payload.Signature`) separated by periods. We use a dummy header (`eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9`) and signature (`signature`):
+    ```http
+    Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lIjoiQWxpY2UiLCJtc2lzZG4iOiIxMjM0NTY3ODkifQ==.signature
+    ```
+
+---
+
+## JSON Deny Responses
+
+When the external authorizer blocks a request, it returns a structured JSON payload with `403 Forbidden` rather than plain text, facilitating client-side parsing:
+
+```json
+{
+  "status": 403,
+  "error": "Forbidden",
+  "message": "The token's MSISDN does not match the requested path's MSISDN.",
+  "reason": "path-msisdn-mismatch"
+}
 ```
 
-Verify that Istio's components are successfully installed and running:
-```bash
-kubectl get pods -n istio-system
-```
+---
+
+## Run Validation Tests
+Check **[test-curl.md](file:///mydata/codes/2026/istio-testing-ext-authz/test-curl.md)** for full testing details and copy-pasteable curls to test mismatched and matching MSISDN validation!
+
