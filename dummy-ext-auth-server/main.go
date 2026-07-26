@@ -36,7 +36,8 @@ func respondDeny(w http.ResponseWriter, status int, reason string, msg string) {
 }
 
 func handleAuth(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Received request from %s %s", r.RemoteAddr, r.URL.Path)
+	// r.Host contains the original HTTP/2 :authority or Host header forwarded by Envoy!
+	log.Printf("Received request from %s | Method: %s | Host/Service: %s | Path: %s", r.RemoteAddr, r.Method, r.Host, r.URL.Path)
 	log.Println("--- Incoming Headers ---")
 	for name, values := range r.Header {
 		for _, value := range values {
