@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dummy-svc-app
+  namespace: foo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dummy-svc-app
+  template:
+    metadata:
+      labels:
+        app: dummy-svc-app
+    spec:
+      containers:
+      - name: app
+        image: dummy-svc-app:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dummy-svc-app
+  namespace: foo
+spec:
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  selector:
+    app: dummy-svc-app
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: dummy-svc-app-policy
+  namespace: foo
+spec:
+  selector:
+    matchLabels:
+      app: dummy-svc-app
+  action: CUSTOM
+  provider:
+    name: "ext-authz-http"
+  rules:
+  - to:
+    - operation:
+        paths: ["/v1/customer/*"]
