@@ -160,6 +160,31 @@ In this architecture, **no `RequestAuthentication` resource is used or needed**:
 * **Dynamic Interception Logic**: Standard `RequestAuthentication` cannot correlate dynamic path parameters (e.g. `/v1/customer/{msisdn}`) against token claims (`payload.msisdn`) to mitigate BOLA/IDOR threats.
 * **Consolidated Duties**: The custom Go external check server performs both roles at once: it parses the bearer token, validates the inner claims matching the URL, and signals Envoy to allow or block the traffic. This avoids external JWKS infrastructure dependencies for local testing.
 
+### 5. Routing and Path Resolution (Default vs Custom `pathPrefix`)
+How are HTTP request paths routed to the external authorizer?
+
+#### Default Behavior (No static path configured)
+By default, Envoy's HTTP external authorization filter **forwards the original client's request path and method** to the external check server. 
+* If a client calls `GET /v1/customer/123456789`, Envoy issues a check request with `Path: /v1/customer/123456789` to your service.
+* This is why the external authorizer's `main.go` parses the MSISDN from `r.URL.Path` directly.
+
+#### Custom Behavior (Prepending with `pathPrefix`)
+If your external middleware/service listens on a fixed endpoint (e.g., `/check` or `/validate`), you can configure the **`pathPrefix`** option in the extension provider configuration:
+
+```yaml
+meshConfig:
+  extensionProviders:
+  - name: "ext-authz-http"
+    envoyExtAuthzHttp:
+      service: "ext-authz.foo.svc.cluster.local"
+      port: 8000
+      # PREPENDS this path to the outgoing check requests:
+      pathPrefix: "/check"
+      includeRequestHeadersInCheck: ["authorization", "cookie", "x-ext-authz"]
+```
+With `pathPrefix: "/check"`, if a client calls `GET /v1/customer/123456789`, the check request sent to the external authorizer will target:
+* **Path**: `/check/v1/customer/123456789`
+
 ---
 
 ## 🛡️ Threat Mitigation & Isolation
