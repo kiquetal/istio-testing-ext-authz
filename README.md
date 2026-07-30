@@ -126,6 +126,40 @@ meshConfig:
 | **`headersToUpstreamOnAllow`** | `X-Auth-User`, `X-Auth-Email` | Headers set by the Authorizer on success that Envoy will inject into the request forwarded to the backend. |
 | **`headersToDownstreamOnDeny`** | `Content-Type`, `X-Auth-Reason` | Headers set by the Authorizer on failure that Envoy will return to the client in the `403 Forbidden` response. |
 
+### 3. AuthorizationPolicy Configuration
+To trigger the external authorizer, an `AuthorizationPolicy` with `action: CUSTOM` is configured for each application.
+
+* **For httpbin**: Secures `/headers` and routes checks to `ext-authz-http`. (See [manifest/app.yaml](file:///mydata/codes/2026/istio-testing-ext-authz/manifest/app.yaml#L36-L52))
+* **For dummy-svc-app**: Secures `/v1/customer/*` and routes checks to `ext-authz-http`. (See [manifest/dummy-svc-app.yaml](file:///mydata/codes/2026/istio-testing-ext-authz/manifest/dummy-svc-app.yaml#L36-L52))
+
+```yaml
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: dummy-svc-app-policy
+  namespace: foo
+spec:
+  selector:
+    matchLabels:
+      app: dummy-svc-app
+  action: CUSTOM
+  provider:
+    name: "ext-authz-http"
+  rules:
+  - to:
+    - operation:
+        paths: ["/v1/customer/*"]
+```
+
+### 4. Why is there no `RequestAuthentication` resource?
+In standard Istio, token verification is often split:
+1. `RequestAuthentication` decodes and validates the JWT signature via a JWKS endpoint.
+2. `AuthorizationPolicy` permits or denies access based on the verified claims.
+
+In this architecture, **no `RequestAuthentication` resource is used or needed**:
+* **Dynamic Interception Logic**: Standard `RequestAuthentication` cannot correlate dynamic path parameters (e.g. `/v1/customer/{msisdn}`) against token claims (`payload.msisdn`) to mitigate BOLA/IDOR threats.
+* **Consolidated Duties**: The custom Go external check server performs both roles at once: it parses the bearer token, validates the inner claims matching the URL, and signals Envoy to allow or block the traffic. This avoids external JWKS infrastructure dependencies for local testing.
+
 ---
 
 ## 🛡️ Threat Mitigation & Isolation
