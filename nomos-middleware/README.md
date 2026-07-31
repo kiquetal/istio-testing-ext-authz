@@ -86,3 +86,23 @@ To prevent sudden spikes (e.g. 300+ req/s hitting a newly started node daemon) f
 - Even if a node starts up with a cold L1 cache, it immediately retrieves warm rules from L2 (Redis) in under 1.5ms, avoiding expensive calls to the central rules engine.
 - **Automatic Cleanup**: With a 15-second L1 expiration, inactive rules are automatically cleaned up by Go's garbage collector, ensuring flat-line memory utilization over time.
 
+### 3. Primary-Association Access Pattern & Conditional Enrichment
+
+A key functional requirement of this middleware is managing delegation of access (e.g., a "Father" requesting access to one of multiple associated "Children" accounts, where those accounts are not pre-bundled inside the primary identity token to keep the JWT compact).
+
+#### The Business Case:
+- The user's ID token holds their primary identifier (e.g. `primary_msisdn`).
+- The JWT contains a specific Boolean claim: **`allAl`**.
+  - **`allAl = true`**: The ID token already contains the full list of allowed accounts. No extra lookup is needed.
+  - **`allAl = false`**: The ID token only contains a partial response due to size limits.
+- When `allAl` is **`false`**, the middleware automatically triggers the **Enrichment Fallback**.
+- The enrichment API returns the full list of associated sub-accounts.
+- The middleware validates whether the requested path parameter (e.g. child account) belongs to the retrieved list.
+
+#### Primary-Association Schema:
+To implement this cleanly and prepare for shared Redis (L2) integration, the resolved delegation relationship is cached as a **`Primary-Association`**:
+- **Cache Key**: `enrichment:primary-association:{primary_msisdn}`
+- **Cache Value**: Set/Slice of all authorized associated child account IDs (e.g. `["child-1", "child-2", ...]`).
+- **Trigger**: Checked on every request; enrichment call is executed **exclusively** when `allAl == false` to ensure maximum efficiency.
+
+
