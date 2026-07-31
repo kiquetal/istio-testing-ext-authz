@@ -99,10 +99,17 @@ A key functional requirement of this middleware is managing delegation of access
 - The enrichment API returns the full list of associated sub-accounts.
 - The middleware validates whether the requested path parameter (e.g. child account) belongs to the retrieved list.
 
-#### Primary-Association Schema:
-To implement this cleanly and prepare for shared Redis (L2) integration, the resolved delegation relationship is cached as a **`Primary-Association`**:
-- **Cache Key**: `enrichment:primary-association:{primary_msisdn}`
-- **Cache Value**: Set/Slice of all authorized associated child account IDs (e.g. `["child-1", "child-2", ...]`).
-- **Trigger**: Checked on every request; enrichment call is executed **exclusively** when `allAl == false` to ensure maximum efficiency.
+#### Primary-Association Schema & L1 Enrichment Cache:
+To implement this cleanly and prepare for shared Redis (L2) integration, the resolved delegation relationship is cached as a **`Primary-Association`** using a dedicated, short-lived **L1 Enrichment Cache**:
+- **Cache Key**: `enrichment:primary-association:{primary_msisdn}` (or `token:endpoint` locally)
+- **Cache Value**: The parsed slice/set of all authorized associated child account IDs (e.g. `["child-1", "child-2", ...]`).
+- **Trigger**: Checked on every incoming request. The enrichment call is executed **exclusively** when `allAl == false` to ensure maximum efficiency.
+
+#### How the L1 Enrichment Cache solves Parallel Dashboard Requests:
+When a user (the "Father") logs in, the dashboard client often fires 8-10 parallel, concurrent requests to get the balance and status of all his associated sub-accounts (the "Children") simultaneously.
+1. **Request 1 (Child A)**: Finds no cache. Triggers the outbound enrichment call, fetches the complete list of associated accounts, validates Child A, and **populates the L1 Enrichment Cache**.
+2. **Requests 2-8 (Children B to H)**: Arrive milliseconds later. They instantly hit the warm **L1 Enrichment Cache** in under **1 microsecond**, completely avoiding duplicate external network calls.
+3. This protects downstream user/profile databases from **8x traffic amplification** during login/dashboard load sequences.
+
 
 
