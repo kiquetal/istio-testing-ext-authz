@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -25,6 +26,26 @@ var config = Config{
 	Port:         "8080",
 	NomosService: "http://nomos-service.default.svc.cluster.local:8080",
 	RulesTTL:     5 * time.Minute,
+}
+
+var httpClient *http.Client
+
+func init() {
+	transport := &http.Transport{
+		MaxIdleConns:        500,
+		MaxIdleConnsPerHost: 200,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   2 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 2 * time.Second,
+	}
+
+	httpClient = &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+	}
 }
 
 // In-memory Cache item with expiration
@@ -457,8 +478,7 @@ func fetchRulesFromNomos(proxy, aud, iss, method string) (*RulesResponse, error)
 	q.Add("method", method)
 	req.URL.RawQuery = q.Encode()
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -485,8 +505,7 @@ func callEnrichmentEndpoint(domain, endpoint, token string) (map[string]any, err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+token)
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
