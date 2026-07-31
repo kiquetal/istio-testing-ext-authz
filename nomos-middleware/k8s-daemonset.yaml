@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nomos-middleware
+  namespace: default
+  labels:
+    app: nomos-middleware
+spec:
+  selector:
+    matchLabels:
+      app: nomos-middleware
+  template:
+    metadata:
+      labels:
+        app: nomos-middleware
+    spec:
+      # ensures high priority scheduling if needed
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nomos-middleware
+          image: your-registry/nomos-middleware:latest # Replace with your docker registry path
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: PORT
+              value: "8080"
+            - name: NOMOS_SVC_URL
+              value: "http://nomos-service.default.svc.cluster.local:8080"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nomos-middleware
+  namespace: default
+  labels:
+    app: nomos-middleware
+spec:
+  selector:
+    app: nomos-middleware
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+  # CRITICAL: Routes traffic only to the replica on the SAME physical node
+  internalTrafficPolicy: Local
