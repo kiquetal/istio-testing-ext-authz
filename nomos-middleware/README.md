@@ -74,9 +74,21 @@ go build -o nomos-middleware main.go
 This middleware is engineered specifically for large-scale production microservices environments (handling **300+ services** and **30,000+ aggregate req/s**):
 
 ### 1. Sharded Memory Footprint (DaemonSet Model)
-Instead of running **300+ sidecar containers** (which wastes cluster memory), this middleware is designed to run as a **DaemonSet** (one pod per physical VM/node) configured with `internalTrafficPolicy: Local` on its Kubernetes Service:
-- **Node-Localized Cache**: A middleware pod only caches rules for the specific subset of services running on its same physical worker node (usually 5-15 services). It never loads or wastes memory on the other 280+ services.
-- **Ultra-lean RAM consumption**: At 30 services active per node and 500 unique active rule combinations, the Go L1 memory footprint remains incredibly small (**~15MB to 20MB** per node-replica).
+
+> [!IMPORTANT]
+> **Sidecar Pattern Deprecated**: Injecting this middleware as a sidecar container in all 300+ application pods is deprecated due to excessive resource replication and cluster-wide configuration drift.
+
+Instead of running sidecars, this middleware is engineered to run as a **DaemonSet** (exactly one pod per physical VM/worker node) configured with `internalTrafficPolicy: Local` on its Kubernetes Service. 
+
+#### Why DaemonSet is Chosen Over a Centralized Deployment:
+
+| Architectural Metric | Centralized Deployment | Node-Local DaemonSet (Selected) |
+| :--- | :--- | :--- |
+| **Network Hop & Latency** | **Inter-Node Network Hop**: Traffic travels across VM nodes, adding **2ms to 8ms** round-trip network latency on *every* request. | **Node-Local Loopback**: Traffic stays inside local VM memory routing. Runs at **sub-millisecond (< 1ms)** latency. |
+| **Blast Radius & Failure Scope** | **Global Outage**: If the centralized deployment is overloaded or goes down, **all 300+ services** are instantly blocked. | **Node-Isolated**: If a daemon replica on Node A encounters an issue, only Node A is impacted. Nodes B, C, and D remain completely unaffected. |
+| **Auto-Scaling Complexity** | **Complex**: Requires scaling via CPU/Memory-based HPAs configured to guess and adapt to aggregate mesh traffic levels. | **Saves Overhead**: Scales out/in automatically with your node infrastructure. Zero HPA tuning required. |
+| **RAM Sharding** | **Inefficient**: Replicas load aggregate rules for all services. | **High Efficiency**: A replica only caches rules for the 5-15 services running on its specific worker node (~15MB to 20MB per node). |
+
 
 ### 2. TTL Tuning & Caching Philosophy (Production Configuration)
 
