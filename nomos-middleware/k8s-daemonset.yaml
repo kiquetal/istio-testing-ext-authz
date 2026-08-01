@@ -65,3 +65,18 @@ spec:
       targetPort: 8080
   # CRITICAL: Routes traffic only to the replica on the SAME physical node
   internalTrafficPolicy: Local
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: nomos-middleware-local-routing
+  namespace: default
+spec:
+  host: nomos-middleware.default.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      localityLbSetting:
+        enabled: true
+        failoverPriority:
+          - "kubernetes.io/hostname" # Force Envoy to prioritize the SAME host VM node!
+

@@ -80,6 +80,26 @@ This middleware is engineered specifically for large-scale production microservi
 
 Instead of running sidecars, this middleware is engineered to run as a **DaemonSet** (exactly one pod per physical VM/worker node) configured with `internalTrafficPolicy: Local` on its Kubernetes Service. 
 
+> [!WARNING]
+> **Istio Mesh Routing Caveat**: Because Istio Envoy sidecars bypass Kubernetes `kube-proxy` (iptables), the `internalTrafficPolicy: Local` setting is ignored by default. Envoy will round-robin requests globally across all nodes. 
+> To force Envoy to stay node-local, you **must apply an Istio DestinationRule** with hostname-prioritized failover:
+
+```yaml
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: nomos-middleware-local-routing
+  namespace: default
+spec:
+  host: nomos-middleware.default.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      localityLbSetting:
+        enabled: true
+        failoverPriority:
+          - "kubernetes.io/hostname" # Force Envoy to prioritize the SAME host VM node!
+```
+
 #### Why DaemonSet is Chosen Over a Centralized Deployment:
 
 | Architectural Metric | Centralized Deployment | Node-Local DaemonSet (Selected) |
@@ -88,6 +108,43 @@ Instead of running sidecars, this middleware is engineered to run as a **DaemonS
 | **Blast Radius & Failure Scope** | **Global Outage**: If the centralized deployment is overloaded or goes down, **all 300+ services** are instantly blocked. | **Node-Isolated**: If a daemon replica on Node A encounters an issue, only Node A is impacted. Nodes B, C, and D remain completely unaffected. |
 | **Auto-Scaling Complexity** | **Complex**: Requires scaling via CPU/Memory-based HPAs configured to guess and adapt to aggregate mesh traffic levels. | **Saves Overhead**: Scales out/in automatically with your node infrastructure. Zero HPA tuning required. |
 | **RAM Sharding** | **Inefficient**: Replicas load aggregate rules for all services. | **High Efficiency**: A replica only caches rules for the 5-15 services running on its specific worker node (~15MB to 20MB per node). |
+
+---
+
+## How to Validate Node-Local Routing in Production
+
+To verify that Istio is respecting the `DestinationRule` and routing 100% of the authorization traffic locally within the same physical node, use the following validation procedures:
+
+### 1. Inspect Envoy Endpoints via `istioctl`
+Run `istioctl proxy-config endpoint` on any active application pod (e.g. `account-service`). You should observe that only the local Node IP is prioritized with active traffic weights:
+
+```bash
+# Query active endpoints for the nomos-middleware service from an app container
+istioctl proxy-config endpoint <your-app-pod-name> --cluster "outbound|8080||nomos-middleware.default.svc.cluster.local"
+```
+
+* **Expected Output**:
+  You will see multiple IP addresses (corresponding to your DaemonSet pods on different nodes), but the endpoint with the IP of the **same physical node** will be assigned **100% traffic weight** (or marked as `healthy` and preferred in the local routing table).
+
+### 2. Live Log Analysis (The Empirical Test)
+1. Identify two application pods running on different physical nodes:
+   - `pod-alpha` on **Node-1**
+   - `pod-beta` on **Node-2**
+2. Identify the corresponding `nomos-middleware` daemon pods:
+   - `middleware-daemon-1` on **Node-1**
+   - `middleware-daemon-2` on **Node-2**
+3. Tail the logs of both middleware daemons simultaneously:
+   ```bash
+   kubectl logs -f middleware-daemon-1
+   kubectl logs -f middleware-daemon-2
+   ```
+4. Execute test requests from `pod-alpha` (on Node-1):
+   ```bash
+   kubectl exec pod-alpha -- curl -H "X-Target-Service: account-service" http://account-service:8080/check
+   ```
+5. **Validation Verdict**:
+   - **Success**: 100% of the request check logs appear on `middleware-daemon-1` (Node-1). Zero logs appear on `middleware-daemon-2` (Node-2).
+
 
 
 ### 2. TTL Tuning & Caching Philosophy (Production Configuration)
