@@ -78,13 +78,21 @@ Instead of running **300+ sidecar containers** (which wastes cluster memory), th
 - **Node-Localized Cache**: A middleware pod only caches rules for the specific subset of services running on its same physical worker node (usually 5-15 services). It never loads or wastes memory on the other 280+ services.
 - **Ultra-lean RAM consumption**: At 30 services active per node and 500 unique active rule combinations, the Go L1 memory footprint remains incredibly small (**~15MB to 20MB** per node-replica).
 
-### 2. Safeguarding Against "Thundering Herd" (Cold Starts)
-To prevent sudden spikes (e.g. 300+ req/s hitting a newly started node daemon) from hammering the core Nomos database:
-- **Two-Tier Cache Strategy**: 
-  1. **L1 (Go Memory - 15s TTL)**: Shields the network.
-  2. **L2 (Shared Redis - 5m TTL)**: Shields the Nomos core database.
-- Even if a node starts up with a cold L1 cache, it immediately retrieves warm rules from L2 (Redis) in under 1.5ms, avoiding expensive calls to the central rules engine.
-- **Automatic Cleanup**: With a 15-second L1 expiration, inactive rules are automatically cleaned up by Go's garbage collector, ensuring flat-line memory utilization over time.
+### 2. TTL Tuning & Caching Philosophy (Production Configuration)
+
+To optimize database and cache operations at scale, different TTL (Time-To-Live) configurations are used for rules and user-relation data:
+
+- **Rules TTL (1 Hour default)**:
+  - **Philosophy**: API routing and access control policies (defined in Nomos) are highly stable configurations. They do not change minute-by-minute. 
+  - **Benefit**: Setting rules TTL to **1 hour** reduces outbound traffic to your centralized Nomos database to virtually zero (just 1 query per hour per unique proxy-audience).
+  - **Instant Eviction**: If an urgent rule change must propagate immediately, a platform administrator can run a zero-downtime rolling restart of the DaemonSet (`kubectl rollout restart ds nomos-middleware`) which clears L1 memory instantly across all nodes.
+- **Enrichment TTL (1 to 2 Minutes)**:
+  - **Philosophy**: Active user relations (e.g. associated family MSISDNs) are dynamic and session-based.
+  - **Benefit**: Keeps user-sensitive relationship maps in node RAM only while the user is actively navigating. It automatically garbage-collects user session records 2 minutes after they leave the application.
+- **Two-Tier Cache Strategy (with L2 Redis)**:
+  - **L1 (Go Memory - 15-30s TTL)**: Prevents redundant connection pooling spikes.
+  - **L2 (Shared Redis - 1 Hour TTL)**: Acts as the warm data store so newly scaled nodes never have to query the central Neo4j database on startup.
+
 
 ### 3. Primary-Association Access Pattern & Conditional Enrichment
 

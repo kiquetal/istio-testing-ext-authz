@@ -25,7 +25,7 @@ type Config struct {
 var config = Config{
 	Port:         "8080",
 	NomosService: "http://nomos-service.default.svc.cluster.local:8080",
-	RulesTTL:     5 * time.Minute,
+	RulesTTL:     1 * time.Hour,
 }
 
 var httpClient *http.Client
