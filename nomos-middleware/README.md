@@ -190,3 +190,110 @@ When a user (the "Father") logs in, the dashboard client often fires 8-10 parall
 
 
 
+
+---
+
+## Security Tracing Integration
+
+The file `security_tracing_candidate.go` provides OpenTelemetry-based tracing functions for the authorization flow. Below is the integration reference showing where each function is called inside `handleCheck`:
+
+### Trace Waterfall
+
+```
+AuthorizationCheck (root — server span)
+ ├── ResolveNomosRules (client span — network or cache)
+ ├── MatchRule (internal span)
+ ├── EvaluateBOLA/L1/country (internal span)
+ ├── AuditDynamicEnrichment (client span — if triggered)
+ ├── EvaluateBOLA/L2/msisdn (internal span)
+ └── FinalDecision: ALLOW or DENY
+```
+
+### Integration in `handleCheck`
+
+```go
+func handleCheck(w http.ResponseWriter, r *http.Request) {
+    start := time.Now()
+
+    // ─── ROOT SPAN (carries target_service, path, request_id) ───
+    ctx, rootSpan := TraceSecurityCheck(r)
+    defer rootSpan.End()
+
+    // ... decode JWT ...
+    BindClientIdentity(rootSpan, decodedJwt)
+
+    // ─── NOMOS RESOLUTION (measures latency, records cache hit/miss) ───
+    resolveStart := time.Now()
+    var cacheHit bool
+    if cached, found := rulesCache.Get(cacheKey); found {
+        rulesData = cached.(*RulesResponse)
+        cacheHit = true
+    } else {
+        rulesData, err = fetchRulesFromNomos(targetService, audience, issuer, originalMethod)
+        // ... handle error ...
+        rulesCache.Set(cacheKey, rulesData, config.RulesTTL)
+    }
+    TraceNomosResolution(ctx, targetService, audience, issuer, cacheHit, time.Since(resolveStart), len(rulesData.Rules), err)
+
+    // ─── RULE MATCHING ───
+    matchCtx, matchSpan := TraceRuleMatch(ctx, matchedRule.ID, matchedRule.PathPattern, originalPath, len(rulesData.Rules))
+    matchSpan.End()
+
+    // ─── LEVEL 1 VALIDATIONS (fail-fast) ───
+    for _, val := range matchedRule.Validations {
+        if val.Level == 1 {
+            violation, bolaSpan := TraceBOLAEvaluation(matchCtx, 1, matchedRule.ID, matchedRule.PathPattern, val.ParamName, claimVal, pathVal, val.Validation)
+            bolaSpan.End()
+            if violation {
+                AuditFinalDecision(rootSpan, false, "L1_MISMATCH", "...")
+                EmitSecurityAuditLog(SecurityAuditEntry{Decision: "DENY", ...})
+                return
+            }
+        }
+    }
+
+    // ─── LEVEL 2 VALIDATIONS (ownership + optional enrichment) ───
+    var enriched bool
+    for _, val := range matchedRule.Validations {
+        if val.Level == 2 {
+            if needsEnrichment {
+                enrichStart := time.Now()
+                enrichedData, err = callEnrichmentEndpoint(domain, val.Enrichment.Endpoint, token)
+                TraceDynamicEnrichment(ctx, val.Enrichment.Endpoint, val.Enrichment.DomainFrom, enrichCacheHit, time.Since(enrichStart), err == nil, err)
+                enriched = true
+            }
+            violation, bolaSpan := TraceBOLAEvaluation(matchCtx, 2, matchedRule.ID, matchedRule.PathPattern, val.ParamName, claimVal, pathVal, val.Validation)
+            bolaSpan.End()
+            if violation {
+                AuditFinalDecision(rootSpan, false, "L2_OWNERSHIP_VERIFICATION_FAILED", "...")
+                EmitSecurityAuditLog(SecurityAuditEntry{Decision: "DENY", ...})
+                return
+            }
+        }
+    }
+
+    // ─── ALLOW ───
+    AuditFinalDecision(rootSpan, true, "", "")
+
+    // ─── STRUCTURED AUDIT LOG (always emitted, works without OTel collector) ───
+    EmitSecurityAuditLog(SecurityAuditEntry{
+        RequestID:     requestID,
+        TargetService: targetService,
+        Path:          originalPath,
+        Method:        originalMethod,
+        Subject:       subject,
+        Issuer:        issuer,
+        Audience:      audience,
+        MatchedRule:   matchedRule.ID,
+        RulePattern:   matchedRule.PathPattern,
+        Decision:      "ALLOW",
+        DurationMs:    time.Since(start).Milliseconds(),
+        CacheHit:      cacheHit,
+        Enriched:      enriched,
+    })
+}
+```
+
+> **Note:** The latency for the Nomos call is measured with `time.Since(resolveStart)` and recorded as `nomos.resolution_ms` on the `ResolveNomosRules` span. The middleware has no visibility into Neo4j — it only measures the round-trip to the Nomos Quarkus service.
+
+For full details on span attributes, SIEM alerting, and security constraints, see [`SECURITY_FOCUS.md`](./SECURITY_FOCUS.md).
