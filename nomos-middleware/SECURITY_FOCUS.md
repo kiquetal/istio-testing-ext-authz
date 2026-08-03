@@ -87,13 +87,15 @@ This is the **primary external dependency**. Without this span, you cannot disti
 | `nomos.failure_type` | Classification: `TIMEOUT`, `UNREACHABLE`, `ACCESS_DENIED`, `UNKNOWN` |
 | `nomos.rules_returned` | Sanity check — 0 rules + deny policy = blocked |
 
-Error classification logic:
+Error classification logic (as seen by the middleware):
 ```
 403 from Nomos     → ACCESS_DENIED (audience/proxy mismatch)
-Timeout/deadline   → TIMEOUT (Nomos or Neo4j overloaded)
+Timeout/deadline   → TIMEOUT (Nomos service unresponsive)
 Connection refused → UNREACHABLE (pod down, DNS failure)
 Other              → UNKNOWN (investigate)
 ```
+
+> **Note:** The middleware has no visibility into Neo4j. A `TIMEOUT` could be caused by Neo4j being overloaded, but the middleware only sees "Nomos didn't respond in time." Neo4j latency is a Nomos-side concern — check Nomos service logs and Neo4j metrics when this alert fires.
 
 ---
 
@@ -187,12 +189,14 @@ Configure alerts in your SIEM (Datadog, Splunk, Elastic, CloudWatch) for these p
 | Alert | Query | Severity | Action |
 |-------|-------|----------|--------|
 | BOLA Attempt | `security.violation_type == "BOLA_IDOR_ATTEMPT"` | 🔴 High | Block source, investigate token |
-| Nomos Unreachable | `nomos.failure_type == "UNREACHABLE"` | 🔴 Critical | Check nomos-service pods, Neo4j |
-| Nomos Timeout | `nomos.failure_type == "TIMEOUT"` | 🟡 Warning | Check Neo4j latency, connection pool |
+| Nomos Unreachable | `nomos.failure_type == "UNREACHABLE"` | 🔴 Critical | Check nomos-service pods, DNS resolution |
+| Nomos Timeout | `nomos.failure_type == "TIMEOUT"` | 🟡 Warning | Check Nomos service logs, then Neo4j latency |
 | Enrichment Failure | `security.audit.failure_stage == "ENRICHMENT_FAILURE"` | 🟡 Warning | Check IdP/enrichment API status |
 | No Rule Match + Deny | `nomos.no_rule_match == true AND security.decision == "DENY"` | 🟡 Info | Possible missing rule configuration |
-| High Latency | `nomos.resolution_ms > 50` | 🟡 Warning | Cache miss storm or Neo4j degradation |
+| High Latency | `nomos.resolution_ms > 50` | 🟡 Warning | Cache miss storm or Nomos degradation |
 | Repeated BOLA (same sub) | `security.violation_type == "BOLA_IDOR_ATTEMPT"` count > 3 in 1min | 🔴 Critical | Automated account lockout candidate |
+
+> **Operator note:** The middleware only measures latency to Nomos (the Quarkus service). It cannot distinguish whether Nomos is slow due to Neo4j, GC pauses, or network. Use Nomos-side metrics and Neo4j dashboards to pinpoint the root cause when timeout/latency alerts fire.
 
 ---
 
