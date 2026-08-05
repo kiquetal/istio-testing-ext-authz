@@ -1,59 +1,23 @@
 package main
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Cache Structure for nomos-middleware
-//
-// Key: "proxy:audience:issuer"
-//   - proxy:    x-target-service header (which backend)
-//   - audience: JWT aud claim (which credential)
-//   - issuer:   JWT iss claim (which IDP)
-//
-// This triplet is exactly what we send to Nomos: GET /rules?proxy=X&aud=Y&iss=Z
-// Same input → same response → same cache entry.
-//
-// NOT in the key:
-//   - method:  Nomos returns ALL rules regardless of method. Filter post-cache.
-//   - appId:   Middleware doesn't know it. Nomos resolves it. It's output.
-// ─────────────────────────────────────────────────────────────────────────────
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
 
-import "time"
+	// "github.com/redis/go-redis/v9"
+	// "context"
+
+	"golang.org/x/sync/singleflight"
+)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CachedResult — the single value stored at each cache key
-// Represents BOTH success (200) and denial (403) from Nomos.
-// ─────────────────────────────────────────────────────────────────────────────
-
-type CachedResult struct {
-	// ── Success (Nomos returned 200) ──
-	Rules *RulesResponse // full response: proxy, appId, idp, defaultPolicy, rules[]
-
-	// ── Denial (Nomos returned 403) ──
-	Denied      bool   // true if Nomos denied this triplet
-	DenyCode    string // "UNKNOWN_AUDIENCE" or "PROXY_NOT_ALLOWED"
-	DenyMessage string
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// What Nomos returns (already defined in main.go, shown here for reference)
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// type RulesResponse struct {
-//     Proxy         string         `json:"proxy"`
-//     AppID         string         `json:"appId"`
-//     IDP           string         `json:"idp"`
-//     DefaultPolicy string         `json:"defaultPolicy"`
-//     Rules         []RuleContract `json:"rules"`
-// }
-//
-// type RuleContract struct {
-//     ID          string               `json:"id"`
-//     PathPattern string               `json:"pathPattern"`
-//     Methods     []string             `json:"methods"`       // ["GET","POST"]
-//     Validations []ValidationContract `json:"validations"`
-// }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Cache Key construction
+// Cache Key: "proxy:audience:issuer"
+// NOT method (Nomos returns all rules, filter post-cache)
+// NOT appId (middleware doesn't know it, Nomos resolves it)
 // ─────────────────────────────────────────────────────────────────────────────
 
 func buildCacheKey(proxy, audience, issuer string) string {
@@ -61,130 +25,259 @@ func buildCacheKey(proxy, audience, issuer string) string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// How each layer stores it
+// CachedResult — stores both 200 (success) and 403 (denial) from Nomos
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// ┌────────────────────────────────────────────────────────────────────────┐
-// │ L1 — Go in-memory (per node)                                          │
-// │                                                                        │
-// │   Key:   "tigo-mobile-pa-billing-v1:bZZwD10J...:https://id.tigo.com.pa"│
-// │   Value: *CachedResult (pointer, zero-copy)                            │
-// │   TTL:   30 seconds                                                    │
-// │                                                                        │
-// │   Why 30s: short enough to re-sync with Redis if entry was invalidated │
-// │   Memory: ~1.7KB per entry × 750 entries = ~1.3MB per node             │
-// └────────────────────────────────────────────────────────────────────────┘
-//
-// ┌────────────────────────────────────────────────────────────────────────┐
-// │ L2 — Redis (shared across all nodes)                                   │
-// │                                                                        │
-// │   Key:   "nomos:rules:tigo-mobile-pa-billing-v1:bZZwD10J...:https://id.tigo.com.pa"
-// │   Value: JSON serialized CachedResult                                  │
-// │   TTL:   1 hour (success) / 5 minutes (denial)                         │
-// │                                                                        │
-// │   Why prefix "nomos:rules:": namespace in shared Redis                 │
-// │   Why 1h: rules are stable config, change via admin API only           │
-// │   Why 5min for denial: revoked access shouldn't linger long,           │
-// │           but still protects Nomos from repeated invalid queries        │
-// └────────────────────────────────────────────────────────────────────────┘
-//
-// ┌────────────────────────────────────────────────────────────────────────┐
-// │ L3 — Nomos service (source of truth)                                   │
-// │                                                                        │
-// │   GET /nomos/v1/api/rules?proxy=X&aud=Y&iss=Z                         │
-// │                                                                        │
-// │   Returns:                                                             │
-// │     200 → { proxy, appId, idp, defaultPolicy, rules[] }               │
-// │     403 → { error: "UNKNOWN_AUDIENCE" | "PROXY_NOT_ALLOWED" }          │
-// │                                                                        │
-// │   Called ONLY on L1 miss + L2 miss                                     │
-// │   At steady state: ~0 calls/hour (everything served from cache)        │
-// └────────────────────────────────────────────────────────────────────────┘
+
+type CachedResult struct {
+	Rules       *RulesResponse `json:"rules,omitempty"`
+	Denied      bool           `json:"denied"`
+	DenyCode    string         `json:"denyCode,omitempty"`
+	DenyMessage string         `json:"denyMessage,omitempty"`
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Lookup flow (pseudocode)
+// TTLs
+// ─────────────────────────────────────────────────────────────────────────────
+
+const (
+	L1SuccessTTL = 30 * time.Second
+	L1DenialTTL  = 5 * time.Minute
+	// L2SuccessTTL = 1 * time.Hour    // Redis
+	// L2DenialTTL  = 5 * time.Minute  // Redis
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// L1 Cache (in-memory, per node)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type L1Cache struct {
+	mu    sync.RWMutex
+	items map[string]l1Entry
+}
+
+type l1Entry struct {
+	result     *CachedResult
+	expiration int64
+}
+
+func NewL1Cache() *L1Cache {
+	c := &L1Cache{items: make(map[string]l1Entry)}
+	go c.cleanup()
+	return c
+}
+
+func (c *L1Cache) Get(key string) (*CachedResult, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, found := c.items[key]
+	if !found || time.Now().UnixNano() > entry.expiration {
+		return nil, false
+	}
+	return entry.result, true
+}
+
+func (c *L1Cache) Set(key string, result *CachedResult, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items[key] = l1Entry{
+		result:     result,
+		expiration: time.Now().Add(ttl).UnixNano(),
+	}
+}
+
+func (c *L1Cache) cleanup() {
+	ticker := time.NewTicker(1 * time.Minute)
+	for range ticker.C {
+		c.mu.Lock()
+		now := time.Now().UnixNano()
+		for k, v := range c.items {
+			if now > v.expiration {
+				delete(c.items, k)
+			}
+		}
+		c.mu.Unlock()
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Redis L2 (commented out — uncomment when ready)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// var redisClient *redis.Client
+//
+// func initRedis() {
+//     redisClient = redis.NewClient(&redis.Options{
+//         Addr: os.Getenv("REDIS_ADDR"), // e.g. "redis:6379"
+//     })
+// }
+//
+// func redisGet(key string) (*CachedResult, bool) {
+//     ctx := context.Background()
+//     data, err := redisClient.Get(ctx, "nomos:rules:"+key).Bytes()
+//     if err != nil {
+//         return nil, false
+//     }
+//     var result CachedResult
+//     if err := json.Unmarshal(data, &result); err != nil {
+//         return nil, false
+//     }
+//     return &result, true
+// }
+//
+// func redisSet(key string, result *CachedResult, ttl time.Duration) {
+//     ctx := context.Background()
+//     data, err := json.Marshal(result)
+//     if err != nil {
+//         return
+//     }
+//     redisClient.Set(ctx, "nomos:rules:"+key, data, ttl)
+// }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Resolver — the single function main.go calls
+// ─────────────────────────────────────────────────────────────────────────────
+
+var (
+	l1        = NewL1Cache()
+	flight    singleflight.Group
+)
+
+// ResolveRules is the entry point called from handleCheck.
+// It handles L1 → (L2 Redis) → L3 Nomos with singleflight dedup.
+func ResolveRules(proxy, audience, issuer string) (*CachedResult, error) {
+	key := buildCacheKey(proxy, audience, issuer)
+
+	// ── L1: in-memory (sub-microsecond) ──
+	if result, found := l1.Get(key); found {
+		return result, nil
+	}
+
+	// ── L2: Redis (uncomment when ready) ──
+	// if result, found := redisGet(key); found {
+	//     l1.Set(key, result, L1SuccessTTL)
+	//     return result, nil
+	// }
+
+	// ── L3: Nomos (with singleflight to prevent thundering herd) ──
+	val, err, _ := flight.Do(key, func() (interface{}, error) {
+		return fetchAndCache(proxy, audience, issuer, key)
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return val.(*CachedResult), nil
+}
+
+// fetchAndCache calls Nomos and stores the result in L1 (and L2 when enabled).
+func fetchAndCache(proxy, audience, issuer, key string) (*CachedResult, error) {
+	rulesData, err := fetchRulesFromNomos(proxy, audience, issuer, "")
+
+	if err != nil {
+		// Check if Nomos returned 403
+		if strings.Contains(err.Error(), "status code 403") {
+			denied := &CachedResult{
+				Denied:      true,
+				DenyCode:    "NOMOS_FORBIDDEN",
+				DenyMessage: err.Error(),
+			}
+			l1.Set(key, denied, L1DenialTTL)
+			// redisSet(key, denied, L2DenialTTL)
+			return denied, nil
+		}
+		// Real error (timeout, unreachable) — don't cache, let caller handle
+		return nil, err
+	}
+
+	// Success — cache the rules
+	success := &CachedResult{Rules: rulesData}
+	l1.Set(key, success, L1SuccessTTL)
+	// redisSet(key, success, L2SuccessTTL)
+
+	log.Printf("Cached rules for key='%s': %d rules, defaultPolicy='%s'",
+		key, len(rulesData.Rules), rulesData.DefaultPolicy)
+
+	return success, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debug endpoint — dump cache contents (optional, remove in prod)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func handleDebugCache(w interface{ Write([]byte) (int, error) }) {
+	l1.mu.RLock()
+	defer l1.mu.RUnlock()
+
+	type debugEntry struct {
+		Key     string        `json:"key"`
+		Denied  bool          `json:"denied"`
+		Rules   int           `json:"rules"`
+		TTLLeft time.Duration `json:"ttl_left"`
+	}
+
+	now := time.Now().UnixNano()
+	entries := make([]debugEntry, 0, len(l1.items))
+	for k, v := range l1.items {
+		ruleCount := 0
+		if v.result.Rules != nil {
+			ruleCount = len(v.result.Rules.Rules)
+		}
+		entries = append(entries, debugEntry{
+			Key:     k,
+			Denied:  v.result.Denied,
+			Rules:   ruleCount,
+			TTLLeft: time.Duration(v.expiration-now) / time.Millisecond,
+		})
+	}
+	json.NewEncoder(w).Encode(entries)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Usage from handleCheck (replace the current cache block):
 // ─────────────────────────────────────────────────────────────────────────────
 //
-//   func resolveRules(proxy, audience, issuer string) (*CachedResult, error) {
-//       key := buildCacheKey(proxy, audience, issuer)
-//
-//       // ── L1: in-memory (sub-microsecond) ──
-//       if result, found := l1Cache.Get(key); found {
-//           return result.(*CachedResult), nil
-//       }
-//
-//       // ── L2: Redis (0.1-0.5ms) ──
-//       if data, err := redis.Get(ctx, "nomos:rules:"+key).Bytes(); err == nil {
-//           var result CachedResult
-//           json.Unmarshal(data, &result)
-//           l1Cache.Set(key, &result, 30*time.Second)  // promote to L1
-//           return &result, nil
-//       }
-//
-//       // ── L3: Nomos (5-10ms) ──
-//       // Use singleflight to avoid thundering herd
-//       val, err, _ := flight.Do(key, func() (interface{}, error) {
-//           return fetchFromNomos(proxy, audience, issuer)
-//       })
-//
-//       if err != nil {
-//           // Nomos returned 403 — cache the denial
-//           denied := &CachedResult{Denied: true, DenyCode: "...", DenyMessage: "..."}
-//           l1Cache.Set(key, denied, 5*time.Minute)
-//           redisSet("nomos:rules:"+key, denied, 5*time.Minute)
-//           return denied, nil
-//       }
-//
-//       // Nomos returned 200 — cache success
-//       success := &CachedResult{Rules: val.(*RulesResponse)}
-//       l1Cache.Set(key, success, 30*time.Second)
-//       redisSet("nomos:rules:"+key, success, 1*time.Hour)
-//       return success, nil
+//   result, err := ResolveRules(targetService, audience, issuer)
+//   if err != nil {
+//       respondDeny(w, 500, "NOMOS_CONNECTIVITY_ERROR", err.Error())
+//       return
 //   }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// After cache resolution — method filtering and rule matching
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//   result := resolveRules(proxy, audience, issuer)
-//
 //   if result.Denied {
 //       respondDeny(w, 403, result.DenyCode, result.DenyMessage)
 //       return
 //   }
 //
-//   // Match path + method against cached rules
-//   for _, rule := range result.Rules.Rules {
-//       if !slices.Contains(rule.Methods, originalMethod) {
-//           continue  // method doesn't apply to this rule
+//   rulesData := result.Rules
+//
+//   // Match path + filter by method
+//   for i := range rulesData.Rules {
+//       rule := &rulesData.Rules[i]
+//       if !matchesMethod(rule.Methods, originalMethod) {
+//           continue
 //       }
 //       params := extractParams(rule.PathPattern, originalPath)
 //       if params != nil {
-//           matchedRule = &rule
+//           matchedRule = rule
 //           extractedParams = params
 //           break
 //       }
 //   }
-//
-//   // No match → use defaultPolicy
-//   if matchedRule == nil {
-//       if result.Rules.DefaultPolicy == "allow" {
-//           respondAllow(...)
-//       } else {
-//           respondDeny(...)
-//       }
-//       return
-//   }
-//
-//   // Matched → run L1/L2 validations as before...
+//   // ... rest of validation as before ...
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TTL Summary
-// ─────────────────────────────────────────────────────────────────────────────
+// matchesMethod checks if the request method is in the rule's allowed methods.
+// Empty methods list means all methods are allowed.
+func matchesMethod(methods []string, requestMethod string) bool {
+	if len(methods) == 0 {
+		return true
+	}
+	for _, m := range methods {
+		if strings.EqualFold(m, requestMethod) {
+			return true
+		}
+	}
+	return false
+}
 
-const (
-	L1SuccessTTL = 30 * time.Second  // L1 re-syncs with Redis frequently
-	L1DenialTTL  = 5 * time.Minute   // same as L2 denial
-	L2SuccessTTL = 1 * time.Hour     // rules are stable
-	L2DenialTTL  = 5 * time.Minute   // don't block new access grants too long
-)
+// Suppress unused import warning for json
+var _ = fmt.Sprintf
+var _ = json.Marshal
