@@ -168,7 +168,18 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	issuer, _ := decodedJwt["iss"].(string)
 
-	// 2. Resolve Rules (L1 cache → L2 Redis → L3 Nomos, with singleflight)
+	// 2. Resolve Rules
+	// Cache key: "proxy:audience:issuer" (method NOT in key — filter post-cache)
+	//
+	// ResolveRules flow (defined in cache_structure.go):
+	//   L1 hit (rulesCache, 30s TTL)  → return *CachedResult
+	//   L1 miss → L2 Redis (commented) → return *CachedResult
+	//   L2 miss → L3 Nomos GET /nomos/v1/api/rules?proxy=X&aud=Y&iss=Z
+	//           → singleflight dedup (one in-flight call per key)
+	//           → Nomos 200: cache as {Rules: response}
+	//           → Nomos 403: cache as {Denied: true, DenyCode: "..."}
+	//           → Nomos error: don't cache, return error
+	//
 	result, err := ResolveRules(targetService, audience, issuer)
 	if err != nil {
 		log.Printf("Nomos connectivity error: %v", err)
