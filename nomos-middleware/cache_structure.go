@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -146,65 +145,6 @@ var (
 	enrichmentCache = NewMemoryCache() // L1 for enrichment (key: token:endpoint)
 	flight          singleflight.Group
 )
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ResolveRules — the single function handleCheck calls
-// L1 cache → (L2 Redis) → L3 Nomos, with singleflight dedup
-// ─────────────────────────────────────────────────────────────────────────────
-
-func ResolveRules(proxy, audience, issuer string) (*CachedResult, error) {
-	key := buildCacheKey(proxy, audience, issuer)
-
-	// ── L1: in-memory (sub-microsecond) ──
-	if cached, found := rulesCache.Get(key); found {
-		return cached.(*CachedResult), nil
-	}
-
-	// ── L2: Redis (uncomment when ready) ──
-	// if result, found := redisGet(key); found {
-	//     rulesCache.Set(key, result, L1SuccessTTL)
-	//     return result, nil
-	// }
-
-	// ── L3: Nomos (with singleflight to prevent thundering herd) ──
-	val, err, _ := flight.Do(key, func() (interface{}, error) {
-		return fetchAndCache(proxy, audience, issuer, key)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return val.(*CachedResult), nil
-}
-
-// fetchAndCache calls Nomos and stores the result in L1 (and L2 when enabled).
-func fetchAndCache(proxy, audience, issuer, key string) (*CachedResult, error) {
-	rulesData, err := fetchRulesFromNomos(proxy, audience, issuer)
-
-	if err != nil {
-		if strings.Contains(err.Error(), "status code 403") {
-			denied := &CachedResult{
-				Denied:      true,
-				DenyCode:    "NOMOS_FORBIDDEN",
-				DenyMessage: err.Error(),
-			}
-			rulesCache.Set(key, denied, L1DenialTTL)
-			// redisSet(key, denied, L2DenialTTL)
-			return denied, nil
-		}
-		return nil, err
-	}
-
-	success := &CachedResult{Rules: rulesData}
-	rulesCache.Set(key, success, L1SuccessTTL)
-	// redisSet(key, success, L2SuccessTTL)
-
-	log.Printf("Cached rules for key='%s': %d rules, defaultPolicy='%s'",
-		key, len(rulesData.Rules), rulesData.DefaultPolicy)
-
-	return success, nil
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // matchesMethod — filter rules by HTTP method after cache lookup

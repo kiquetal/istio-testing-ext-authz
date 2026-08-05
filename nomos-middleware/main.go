@@ -168,30 +168,53 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	issuer, _ := decodedJwt["iss"].(string)
 
-	// 2. Resolve Rules
-	// Cache key: "proxy:audience:issuer" (method NOT in key — filter post-cache)
-	//
-	// ResolveRules flow (defined in cache_structure.go):
-	//   L1 hit (rulesCache, 30s TTL)  → return *CachedResult
-	//   L1 miss → L2 Redis (commented) → return *CachedResult
-	//   L2 miss → L3 Nomos GET /nomos/v1/api/rules?proxy=X&aud=Y&iss=Z
-	//           → singleflight dedup (one in-flight call per key)
-	//           → Nomos 200: cache as {Rules: response}
-	//           → Nomos 403: cache as {Denied: true, DenyCode: "..."}
-	//           → Nomos error: don't cache, return error
-	//
-	result, err := ResolveRules(targetService, audience, issuer)
-	if err != nil {
-		log.Printf("Nomos connectivity error: %v", err)
-		respondDeny(w, http.StatusInternalServerError, "NOMOS_CONNECTIVITY_ERROR", "Error communicating with rule store: "+err.Error())
-		return
-	}
-	if result.Denied {
-		respondDeny(w, http.StatusForbidden, result.DenyCode, result.DenyMessage)
-		return
-	}
+	// 2. Resolve Rules — L1 → (L2 Redis) → L3 Nomos
+	cacheKey := buildCacheKey(targetService, audience, issuer)
+	var rulesData *RulesResponse
 
-	rulesData := result.Rules
+	if cached, found := rulesCache.Get(cacheKey); found {
+		// L1 cache hit
+		result := cached.(*CachedResult)
+		if result.Denied {
+			respondDeny(w, http.StatusForbidden, result.DenyCode, result.DenyMessage)
+			return
+		}
+		rulesData = result.Rules
+	} else {
+		// L1 miss → call Nomos (with singleflight dedup)
+		val, err, _ := flight.Do(cacheKey, func() (interface{}, error) {
+			resp, err := fetchRulesFromNomos(targetService, audience, issuer)
+			if err != nil {
+				// Nomos returned 403 — cache the denial
+				if strings.Contains(err.Error(), "status code 403") {
+					denied := &CachedResult{Denied: true, DenyCode: "NOMOS_FORBIDDEN", DenyMessage: err.Error()}
+					rulesCache.Set(cacheKey, denied, L1DenialTTL)
+					// redisSet(cacheKey, denied, L2DenialTTL)
+					return denied, nil
+				}
+				// Real error (timeout, unreachable) — don't cache
+				return nil, err
+			}
+			// Nomos returned 200 — cache the rules
+			success := &CachedResult{Rules: resp}
+			rulesCache.Set(cacheKey, success, L1SuccessTTL)
+			// redisSet(cacheKey, success, L2SuccessTTL)
+			return success, nil
+		})
+
+		if err != nil {
+			log.Printf("Nomos connectivity error: %v", err)
+			respondDeny(w, http.StatusInternalServerError, "NOMOS_CONNECTIVITY_ERROR", "Error communicating with rule store: "+err.Error())
+			return
+		}
+
+		result := val.(*CachedResult)
+		if result.Denied {
+			respondDeny(w, http.StatusForbidden, result.DenyCode, result.DenyMessage)
+			return
+		}
+		rulesData = result.Rules
+	}
 
 	// 3. Match rule by Path Pattern + Method
 	var matchedRule *RuleContract
