@@ -106,7 +106,6 @@ func (c *MemoryCache) cleanup() {
 }
 
 var (
-	rulesCache      = NewMemoryCache()
 	enrichmentCache = NewMemoryCache()
 )
 
@@ -132,6 +131,7 @@ type ValidationContract struct {
 type RuleContract struct {
 	ID          string               `json:"id"`
 	PathPattern string               `json:"pathPattern"`
+	Methods     []string             `json:"methods"`
 	Validations []ValidationContract `json:"validations"`
 }
 
@@ -230,33 +230,29 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	issuer, _ := decodedJwt["iss"].(string)
 
-	// 2. Fetch Rules (With Caching)
-	cacheKey := fmt.Sprintf("%s:%s:%s", targetService, audience, originalMethod)
-	var rulesData *RulesResponse
-
-	if cached, found := rulesCache.Get(cacheKey); found {
-		rulesData = cached.(*RulesResponse)
-	} else {
-		var err error
-		rulesData, err = fetchRulesFromNomos(targetService, audience, issuer, originalMethod)
-		if err != nil {
-			if strings.Contains(err.Error(), "status code 403") {
-				respondDeny(w, http.StatusForbidden, "NOMOS_FORBIDDEN", "Nomos access denied: "+err.Error())
-				return
-			}
-			log.Printf("Nomos connection error: %v", err)
-			respondDeny(w, http.StatusInternalServerError, "NOMOS_CONNECTIVITY_ERROR", "Error communicating with rule store: "+err.Error())
-			return
-		}
-		rulesCache.Set(cacheKey, rulesData, config.RulesTTL)
+	// 2. Resolve Rules (L1 cache → L2 Redis → L3 Nomos, with singleflight)
+	result, err := ResolveRules(targetService, audience, issuer)
+	if err != nil {
+		log.Printf("Nomos connectivity error: %v", err)
+		respondDeny(w, http.StatusInternalServerError, "NOMOS_CONNECTIVITY_ERROR", "Error communicating with rule store: "+err.Error())
+		return
+	}
+	if result.Denied {
+		respondDeny(w, http.StatusForbidden, result.DenyCode, result.DenyMessage)
+		return
 	}
 
-	// 3. Match rule by Path Pattern
+	rulesData := result.Rules
+
+	// 3. Match rule by Path Pattern + Method
 	var matchedRule *RuleContract
 	var extractedParams map[string]string
 
 	for i := range rulesData.Rules {
 		rule := &rulesData.Rules[i]
+		if !matchesMethod(rule.Methods, originalMethod) {
+			continue
+		}
 		params := extractParams(rule.PathPattern, originalPath)
 		if params != nil {
 			matchedRule = rule
@@ -465,8 +461,8 @@ func containsValue(claimValue any, target string) bool {
 }
 
 // Fetch rules contract from the centralized Nomos Service
-func fetchRulesFromNomos(proxy, aud, iss, method string) (*RulesResponse, error) {
-	req, err := http.NewRequest("GET", config.NomosService+"/api/v1/rules", nil)
+func fetchRulesFromNomos(proxy, aud, iss string) (*RulesResponse, error) {
+	req, err := http.NewRequest("GET", config.NomosService+"/nomos/v1/api/rules", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -475,7 +471,6 @@ func fetchRulesFromNomos(proxy, aud, iss, method string) (*RulesResponse, error)
 	q.Add("proxy", proxy)
 	q.Add("aud", aud)
 	q.Add("iss", iss)
-	q.Add("method", method)
 	req.URL.RawQuery = q.Encode()
 
 	resp, err := httpClient.Do(req)

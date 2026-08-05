@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -172,7 +171,7 @@ func ResolveRules(proxy, audience, issuer string) (*CachedResult, error) {
 
 // fetchAndCache calls Nomos and stores the result in L1 (and L2 when enabled).
 func fetchAndCache(proxy, audience, issuer, key string) (*CachedResult, error) {
-	rulesData, err := fetchRulesFromNomos(proxy, audience, issuer, "")
+	rulesData, err := fetchRulesFromNomos(proxy, audience, issuer)
 
 	if err != nil {
 		// Check if Nomos returned 403
@@ -277,7 +276,3 @@ func matchesMethod(methods []string, requestMethod string) bool {
 	}
 	return false
 }
-
-// Suppress unused import warning for json
-var _ = fmt.Sprintf
-var _ = json.Marshal
