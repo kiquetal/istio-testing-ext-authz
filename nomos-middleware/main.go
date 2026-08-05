@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -47,67 +46,6 @@ func init() {
 		Timeout:   5 * time.Second,
 	}
 }
-
-// In-memory Cache item with expiration
-type CacheItem struct {
-	Value      interface{}
-	Expiration int64
-}
-
-// Safe Cache implementation
-type MemoryCache struct {
-	mu    sync.RWMutex
-	items map[string]CacheItem
-}
-
-func NewMemoryCache() *MemoryCache {
-	c := &MemoryCache{
-		items: make(map[string]CacheItem),
-	}
-	// Start clean up worker
-	go c.cleanup()
-	return c
-}
-
-func (c *MemoryCache) Set(key string, val interface{}, ttl time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.items[key] = CacheItem{
-		Value:      val,
-		Expiration: time.Now().Add(ttl).UnixNano(),
-	}
-}
-
-func (c *MemoryCache) Get(key string) (interface{}, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	item, found := c.items[key]
-	if !found {
-		return nil, false
-	}
-	if time.Now().UnixNano() > item.Expiration {
-		return nil, false
-	}
-	return item.Value, true
-}
-
-func (c *MemoryCache) cleanup() {
-	ticker := time.NewTicker(1 * time.Minute)
-	for range ticker.C {
-		c.mu.Lock()
-		now := time.Now().UnixNano()
-		for k, v := range c.items {
-			if now > v.Expiration {
-				delete(c.items, k)
-			}
-		}
-		c.mu.Unlock()
-	}
-}
-
-var (
-	enrichmentCache = NewMemoryCache()
-)
 
 // Nomos Response Structs
 type EnrichmentContract struct {

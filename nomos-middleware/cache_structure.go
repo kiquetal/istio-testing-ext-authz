@@ -46,51 +46,56 @@ const (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// L1 Cache (in-memory, per node)
+// MemoryCache — generic in-memory TTL cache (used for rules AND enrichment)
 // ─────────────────────────────────────────────────────────────────────────────
 
-type L1Cache struct {
+type CacheItem struct {
+	Value      interface{}
+	Expiration int64
+}
+
+type MemoryCache struct {
 	mu    sync.RWMutex
-	items map[string]l1Entry
+	items map[string]CacheItem
 }
 
-type l1Entry struct {
-	result     *CachedResult
-	expiration int64
-}
-
-func NewL1Cache() *L1Cache {
-	c := &L1Cache{items: make(map[string]l1Entry)}
+func NewMemoryCache() *MemoryCache {
+	c := &MemoryCache{
+		items: make(map[string]CacheItem),
+	}
 	go c.cleanup()
 	return c
 }
 
-func (c *L1Cache) Get(key string) (*CachedResult, bool) {
+func (c *MemoryCache) Get(key string) (interface{}, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	entry, found := c.items[key]
-	if !found || time.Now().UnixNano() > entry.expiration {
+	item, found := c.items[key]
+	if !found {
 		return nil, false
 	}
-	return entry.result, true
+	if time.Now().UnixNano() > item.Expiration {
+		return nil, false
+	}
+	return item.Value, true
 }
 
-func (c *L1Cache) Set(key string, result *CachedResult, ttl time.Duration) {
+func (c *MemoryCache) Set(key string, val interface{}, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.items[key] = l1Entry{
-		result:     result,
-		expiration: time.Now().Add(ttl).UnixNano(),
+	c.items[key] = CacheItem{
+		Value:      val,
+		Expiration: time.Now().Add(ttl).UnixNano(),
 	}
 }
 
-func (c *L1Cache) cleanup() {
+func (c *MemoryCache) cleanup() {
 	ticker := time.NewTicker(1 * time.Minute)
 	for range ticker.C {
 		c.mu.Lock()
 		now := time.Now().UnixNano()
 		for k, v := range c.items {
-			if now > v.expiration {
+			if now > v.Expiration {
 				delete(c.items, k)
 			}
 		}
@@ -133,27 +138,31 @@ func (c *L1Cache) cleanup() {
 // }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Resolver — the single function main.go calls
+// Global caches + singleflight
 // ─────────────────────────────────────────────────────────────────────────────
 
 var (
-	l1        = NewL1Cache()
-	flight    singleflight.Group
+	rulesCache      = NewMemoryCache() // L1 for rules (key: proxy:aud:iss)
+	enrichmentCache = NewMemoryCache() // L1 for enrichment (key: token:endpoint)
+	flight          singleflight.Group
 )
 
-// ResolveRules is the entry point called from handleCheck.
-// It handles L1 → (L2 Redis) → L3 Nomos with singleflight dedup.
+// ─────────────────────────────────────────────────────────────────────────────
+// ResolveRules — the single function handleCheck calls
+// L1 cache → (L2 Redis) → L3 Nomos, with singleflight dedup
+// ─────────────────────────────────────────────────────────────────────────────
+
 func ResolveRules(proxy, audience, issuer string) (*CachedResult, error) {
 	key := buildCacheKey(proxy, audience, issuer)
 
 	// ── L1: in-memory (sub-microsecond) ──
-	if result, found := l1.Get(key); found {
-		return result, nil
+	if cached, found := rulesCache.Get(key); found {
+		return cached.(*CachedResult), nil
 	}
 
 	// ── L2: Redis (uncomment when ready) ──
 	// if result, found := redisGet(key); found {
-	//     l1.Set(key, result, L1SuccessTTL)
+	//     rulesCache.Set(key, result, L1SuccessTTL)
 	//     return result, nil
 	// }
 
@@ -174,24 +183,21 @@ func fetchAndCache(proxy, audience, issuer, key string) (*CachedResult, error) {
 	rulesData, err := fetchRulesFromNomos(proxy, audience, issuer)
 
 	if err != nil {
-		// Check if Nomos returned 403
 		if strings.Contains(err.Error(), "status code 403") {
 			denied := &CachedResult{
 				Denied:      true,
 				DenyCode:    "NOMOS_FORBIDDEN",
 				DenyMessage: err.Error(),
 			}
-			l1.Set(key, denied, L1DenialTTL)
+			rulesCache.Set(key, denied, L1DenialTTL)
 			// redisSet(key, denied, L2DenialTTL)
 			return denied, nil
 		}
-		// Real error (timeout, unreachable) — don't cache, let caller handle
 		return nil, err
 	}
 
-	// Success — cache the rules
 	success := &CachedResult{Rules: rulesData}
-	l1.Set(key, success, L1SuccessTTL)
+	rulesCache.Set(key, success, L1SuccessTTL)
 	// redisSet(key, success, L2SuccessTTL)
 
 	log.Printf("Cached rules for key='%s': %d rules, defaultPolicy='%s'",
@@ -201,70 +207,10 @@ func fetchAndCache(proxy, audience, issuer, key string) (*CachedResult, error) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Debug endpoint — dump cache contents (optional, remove in prod)
-// ─────────────────────────────────────────────────────────────────────────────
-
-func handleDebugCache(w interface{ Write([]byte) (int, error) }) {
-	l1.mu.RLock()
-	defer l1.mu.RUnlock()
-
-	type debugEntry struct {
-		Key     string        `json:"key"`
-		Denied  bool          `json:"denied"`
-		Rules   int           `json:"rules"`
-		TTLLeft time.Duration `json:"ttl_left"`
-	}
-
-	now := time.Now().UnixNano()
-	entries := make([]debugEntry, 0, len(l1.items))
-	for k, v := range l1.items {
-		ruleCount := 0
-		if v.result.Rules != nil {
-			ruleCount = len(v.result.Rules.Rules)
-		}
-		entries = append(entries, debugEntry{
-			Key:     k,
-			Denied:  v.result.Denied,
-			Rules:   ruleCount,
-			TTLLeft: time.Duration(v.expiration-now) / time.Millisecond,
-		})
-	}
-	json.NewEncoder(w).Encode(entries)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Usage from handleCheck (replace the current cache block):
-// ─────────────────────────────────────────────────────────────────────────────
-//
-//   result, err := ResolveRules(targetService, audience, issuer)
-//   if err != nil {
-//       respondDeny(w, 500, "NOMOS_CONNECTIVITY_ERROR", err.Error())
-//       return
-//   }
-//   if result.Denied {
-//       respondDeny(w, 403, result.DenyCode, result.DenyMessage)
-//       return
-//   }
-//
-//   rulesData := result.Rules
-//
-//   // Match path + filter by method
-//   for i := range rulesData.Rules {
-//       rule := &rulesData.Rules[i]
-//       if !matchesMethod(rule.Methods, originalMethod) {
-//           continue
-//       }
-//       params := extractParams(rule.PathPattern, originalPath)
-//       if params != nil {
-//           matchedRule = rule
-//           extractedParams = params
-//           break
-//       }
-//   }
-//   // ... rest of validation as before ...
-
-// matchesMethod checks if the request method is in the rule's allowed methods.
+// matchesMethod — filter rules by HTTP method after cache lookup
 // Empty methods list means all methods are allowed.
+// ─────────────────────────────────────────────────────────────────────────────
+
 func matchesMethod(methods []string, requestMethod string) bool {
 	if len(methods) == 0 {
 		return true
@@ -275,4 +221,37 @@ func matchesMethod(methods []string, requestMethod string) bool {
 		}
 	}
 	return false
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Debug endpoint — dump L1 cache contents
+// ─────────────────────────────────────────────────────────────────────────────
+
+func handleDebugCache(w interface{ Write([]byte) (int, error) }) {
+	rulesCache.mu.RLock()
+	defer rulesCache.mu.RUnlock()
+
+	type debugEntry struct {
+		Key     string `json:"key"`
+		Denied  bool   `json:"denied"`
+		Rules   int    `json:"rules"`
+		TTLLeft int64  `json:"ttl_left_ms"`
+	}
+
+	now := time.Now().UnixNano()
+	entries := make([]debugEntry, 0, len(rulesCache.items))
+	for k, v := range rulesCache.items {
+		result := v.Value.(*CachedResult)
+		ruleCount := 0
+		if result.Rules != nil {
+			ruleCount = len(result.Rules.Rules)
+		}
+		entries = append(entries, debugEntry{
+			Key:     k,
+			Denied:  result.Denied,
+			Rules:   ruleCount,
+			TTLLeft: (v.Expiration - now) / int64(time.Millisecond),
+		})
+	}
+	json.NewEncoder(w).Encode(entries)
 }
