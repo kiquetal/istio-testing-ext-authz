@@ -297,3 +297,84 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 > **Note:** The latency for the Nomos call is measured with `time.Since(resolveStart)` and recorded as `nomos.resolution_ms` on the `ResolveNomosRules` span. The middleware has no visibility into Neo4j — it only measures the round-trip to the Nomos Quarkus service.
 
 For full details on span attributes, SIEM alerting, and security constraints, see [`SECURITY_FOCUS.md`](./SECURITY_FOCUS.md).
+
+---
+
+## 🔒 Istio Integration: Workload Labeling & AuthorizationPolicy
+
+To enforce external authorization using `nomos-middleware` on microservice requests, you must apply an Istio `AuthorizationPolicy` that targets workloads carrying the label `nomos.security: enabled`.
+
+### 1. Target Service Deployment (Workload) Example
+Add the label `nomos.security: enabled` to the Deployment's **Pod template metadata labels**:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account-service
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: account-service
+  template:
+    metadata:
+      labels:
+        app: account-service
+        nomos.security: enabled # 👈 Activates external authorization check
+    spec:
+      containers:
+        - name: account-service
+          image: your-registry/account-service:latest
+          ports:
+            - containerPort: 8080
+```
+
+### 2. Istio AuthorizationPolicy Example
+Define an `AuthorizationPolicy` with action `CUSTOM` targeting the workloads labeled with `nomos.security: enabled`:
+
+```yaml
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: nomos-external-authz
+  namespace: default # Scope to the namespace containing your services
+spec:
+  selector:
+    matchLabels:
+      nomos.security: enabled # 👈 Selects workloads labeled with this key-value pair
+  action: CUSTOM
+  provider:
+    name: nomos-middleware # 👈 Must match the ExtensionProvider name in MeshConfig
+  rules:
+    - to:
+        - operation:
+            ports: ["8080"] # Protects target application HTTP ports
+```
+
+### 3. Extension Provider Definition (MeshConfig)
+For the `AuthorizationPolicy` above to route checks properly, register the `nomos-middleware` service in Istio's cluster-wide `MeshConfig`:
+
+```yaml
+meshConfig:
+  extensionProviders:
+    - name: "nomos-middleware"
+      envoyExtAuthzHttp:
+        service: "nomos-middleware.default.svc.cluster.local"
+        port: "8080"
+        pathPrefix: "/check" # Middleware check handler
+        headersToUpstreamOnAllow:
+          - "x-nomos-authorization"
+          - "x-nomos-app-id"
+          - "x-nomos-idp"
+        headersToDownstreamOnDeny:
+          - "x-nomos-error"
+          - "x-nomos-param"
+        includeRequestHeadersInCheck:
+          - "authorization"
+          - "x-target-service"
+          - "x-original-uri"
+          - "x-original-path"
+          - "x-original-method"
+```
